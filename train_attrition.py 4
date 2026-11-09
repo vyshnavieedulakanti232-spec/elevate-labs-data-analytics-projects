@@ -1,0 +1,115 @@
+"""
+HR Analytics — Employee Attrition Prediction
+Run from this project folder: python src/train_attrition.py
+Dataset is synthetic and intended for learning/demo purposes.
+"""
+from pathlib import Path
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                             f1_score, confusion_matrix, classification_report,
+                             ConfusionMatrixDisplay)
+
+ROOT = Path(__file__).resolve().parents[1]
+DATA = ROOT / "data" / "hr_employee_sample.csv"
+OUT = ROOT / "outputs"
+OUT.mkdir(exist_ok=True)
+
+df = pd.read_csv(DATA)
+target = "attrition"
+drop_cols = ["employee_id", target]
+X = df.drop(columns=drop_cols)
+y = df[target].map({"No": 0, "Yes": 1})
+
+categorical = X.select_dtypes(include=["object"]).columns.tolist()
+numeric = X.select_dtypes(exclude=["object"]).columns.tolist()
+
+numeric_pipe = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler())
+])
+categorical_pipe = Pipeline([
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("onehot", OneHotEncoder(handle_unknown="ignore"))
+])
+preprocess = ColumnTransformer([
+    ("num", numeric_pipe, numeric),
+    ("cat", categorical_pipe, categorical)
+])
+
+model = Pipeline([
+    ("preprocess", preprocess),
+    ("classifier", RandomForestClassifier(
+        n_estimators=300, class_weight="balanced", random_state=42,
+        min_samples_leaf=3, n_jobs=-1
+    ))
+])
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=.20, random_state=42, stratify=y
+)
+model.fit(X_train, y_train)
+pred = model.predict(X_test)
+proba = model.predict_proba(X_test)[:, 1]
+
+metrics = pd.DataFrame([{
+    "accuracy": accuracy_score(y_test, pred),
+    "precision": precision_score(y_test, pred, zero_division=0),
+    "recall": recall_score(y_test, pred, zero_division=0),
+    "f1_score": f1_score(y_test, pred, zero_division=0)
+}])
+metrics.to_csv(OUT / "model_metrics.csv", index=False)
+(OUT / "classification_report.txt").write_text(
+    classification_report(y_test, pred, target_names=["Stay", "Leave"], zero_division=0)
+)
+
+ConfusionMatrixDisplay.from_predictions(
+    y_test, pred, display_labels=["Stay", "Leave"], cmap="Blues"
+)
+plt.title("Employee Attrition — Confusion Matrix")
+plt.tight_layout()
+plt.savefig(OUT / "confusion_matrix.png", dpi=160)
+plt.close()
+
+# Save employee-level risk scores for HR review
+risk = df.loc[X_test.index, ["employee_id", "department"]].copy()
+risk["actual_attrition"] = y_test.map({0:"No",1:"Yes"})
+risk["predicted_attrition_probability"] = proba
+risk["risk_band"] = pd.cut(
+    proba, bins=[-0.001, .30, .60, 1.0],
+    labels=["Low", "Medium", "High"]
+)
+risk.sort_values("predicted_attrition_probability", ascending=False).to_csv(
+    OUT / "employee_attrition_risk_scores.csv", index=False
+)
+
+# Permutation importance is model-agnostic and easier to reproduce than SHAP.
+from sklearn.inspection import permutation_importance
+perm = permutation_importance(
+    model, X_test, y_test, n_repeats=8, random_state=42,
+    scoring="f1", n_jobs=-1
+)
+importance = pd.DataFrame({
+    "feature": X.columns,
+    "importance_mean": perm.importances_mean,
+    "importance_std": perm.importances_std
+}).sort_values("importance_mean", ascending=False)
+importance.to_csv(OUT / "feature_importance.csv", index=False)
+
+plt.figure(figsize=(8, 5))
+top = importance.head(10).sort_values("importance_mean")
+plt.barh(top["feature"], top["importance_mean"])
+plt.xlabel("Permutation importance (F1 decrease)")
+plt.title("Top Factors Associated with Attrition Predictions")
+plt.tight_layout()
+plt.savefig(OUT / "feature_importance.png", dpi=160)
+plt.close()
+
+print(metrics.to_string(index=False))
+print("Outputs saved to:", OUT)
